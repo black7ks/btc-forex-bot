@@ -91,22 +91,41 @@ def fetch_newsapi() -> list[dict]:
 
 # ─── FILTER: USD + High Impact ────────────────────────────────────────────────
 USD_KEYWORDS = [
+    # USD / ตลาดการเงิน
     "usd", "dollar", "fed", "federal reserve", "fomc", "powell",
     "us economy", "u.s.", "united states", "nonfarm", "us cpi",
     "us gdp", "us inflation", "us jobs", "treasury",
-    "eur/usd", "gbp/usd", "usd/jpy", "usd/cad", "usd/chf"
+    "eur/usd", "gbp/usd", "usd/jpy", "usd/cad", "usd/chf",
+    "wall street", "us market", "american", "us dollar", "greenback",
+    "jobs report", "payroll", "debt", "yield", "bond",
+    # ทรัมป์ + การเมืองสหรัฐฯ ที่กระทบตลาด
+    "trump", "tariff", "trade war", "sanction", "executive order",
+    "white house", "congress", "senate", "pentagon", "iran", "china trade",
+    "mexico", "canada tariff", "nato", "geopolit"
 ]
 HIGH_IMPACT_KEYWORDS = [
     "fed", "federal reserve", "interest rate", "rate hike", "rate cut",
     "inflation", "cpi", "gdp", "nonfarm", "fomc", "powell",
-    "central bank", "monetary policy", "recession", "unemployment"
+    "central bank", "monetary policy", "recession", "unemployment",
+    "jobs", "dollar", "rally", "boost", "trigger", "market outlook",
+    # ทรัมป์ / ภูมิรัฐศาสตร์
+    "trump", "tariff", "trade war", "sanction", "deal", "ceasefire",
+    "iran", "oil", "war", "conflict", "crisis", "breaking"
+]
+
+TRUMP_KEYWORDS = [
+    "trump", "tariff", "trade war", "white house", "executive order",
+    "sanction", "iran", "china trade", "nato", "pentagon", "ceasefire",
+    "deal", "breaking"
 ]
 
 def is_high_impact_usd(title: str, summary: str) -> bool:
     text = (title + " " + summary).lower()
-    usd_hit    = any(kw in text for kw in USD_KEYWORDS)
-    impact_hits = sum(1 for kw in HIGH_IMPACT_KEYWORDS if kw in text)
-    return usd_hit and impact_hits >= 2
+    usd_hit      = any(kw in text for kw in USD_KEYWORDS)
+    impact_hits  = sum(1 for kw in HIGH_IMPACT_KEYWORDS if kw in text)
+    trump_hit    = any(kw in text for kw in TRUMP_KEYWORDS)
+    # ผ่านถ้า: (เกี่ยว USD + มี impact keyword) หรือ (ข่าวทรัมป์/ภูมิรัฐศาสตร์)
+    return (usd_hit and impact_hits >= 1) or trump_hit
 
 
 # ─── ANALYZE via OpenAI ───────────────────────────────────────────────────────
@@ -120,6 +139,8 @@ def analyze_with_gpt(item: dict) -> dict | None:
 ข่าวต้นฉบับ:
 หัวข้อ: {item['title']}
 รายละเอียด: {item['summary'][:1000]}
+
+หมายเหตุ: ข่าวการเมืองสหรัฐฯ เช่น นโยบายทรัมป์ ภาษีนำเข้า สงครามการค้า มาตรการคว่ำบาตร ล้วนกระทบค่าเงิน USD และตลาด Forex โดยตรง ให้วิเคราะห์ผลกระทบเหล่านี้ด้วย
 
 กรุณาวิเคราะห์และตอบเป็น JSON เท่านั้น ตามรูปแบบนี้:
 {{
@@ -161,11 +182,16 @@ def send_to_discord(item: dict, analysis: dict):
     color     = DIRECTION_COLOR.get(direction, 0x3498DB)
     now_th    = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
 
-    # แปลง action string เป็น bullet list
-    action_text = analysis.get("action", "")
-    if action_text and not action_text.startswith("•"):
-        lines = [l.strip() for l in action_text.split("\n") if l.strip()]
+    # แปลง action เป็น bullet list (รองรับทั้ง string และ list จาก GPT)
+    action_raw  = analysis.get("action", "")
+    if isinstance(action_raw, list):
+        # GPT ส่งมาเป็น list → แปลงเป็น bullet
+        action_text = "\n".join(f"• {a.lstrip('•-').strip()}" for a in action_raw if a)
+    elif isinstance(action_raw, str) and action_raw:
+        lines = [l.strip() for l in action_raw.split("\n") if l.strip()]
         action_text = "\n".join(f"• {l.lstrip('•-').strip()}" for l in lines)
+    else:
+        action_text = "-"
 
     # Direction badge
     direction_badge = {
