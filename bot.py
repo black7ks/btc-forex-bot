@@ -47,7 +47,42 @@ def save_sent_ids(ids: set):
         json.dump(list(ids)[-500:], f)
 
 def make_id(text: str) -> str:
-    return hashlib.md5(text.encode()).hexdigest()
+    # normalize ให้ตัวพิมพ์เล็ก ตัดช่องว่างซ้ำ ป้องกันข่าวเบิ้ล
+    normalized = " ".join(text.lower().split())
+    return hashlib.md5(normalized.encode()).hexdigest()
+
+
+# ─── FETCH: ราคาทองคำ real-time ──────────────────────────────────────────────
+def fetch_gold_price() -> str:
+    """ดึงราคาทองคำปัจจุบันจาก public API"""
+    try:
+        # ใช้ metals.live — ฟรี ไม่ต้อง key
+        resp = requests.get(
+            "https://api.metals.live/v1/spot/gold",
+            timeout=8
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            price = data.get("price") or data.get("gold")
+            if price:
+                return f"${float(price):,.2f}"
+    except Exception:
+        pass
+
+    # fallback: frankfurter (ใช้ XAU ต่อ USD)
+    try:
+        resp = requests.get(
+            "https://api.frankfurter.app/latest?from=XAU&to=USD",
+            timeout=8
+        )
+        if resp.status_code == 200:
+            rate = resp.json().get("rates", {}).get("USD")
+            if rate:
+                return f"${float(rate):,.2f}"
+    except Exception:
+        pass
+
+    return "N/A (ไม่สามารถดึงราคาได้)"
 
 
 # ─── FETCH: ForexFactory ──────────────────────────────────────────────────────
@@ -149,12 +184,11 @@ def should_send(title: str, summary: str) -> tuple[bool, str]:
 
 
 # ─── ANALYZE via OpenAI ───────────────────────────────────────────────────────
-def analyze_with_gpt(item: dict) -> dict | None:
-    """
-    ใช้ GPT แปล สรุป และวิเคราะห์ข่าว Forex เป็นภาษาไทย
-    คืนค่า dict พร้อมทุก field สำหรับ Discord embed
-    """
+def analyze_with_gpt(item: dict, gold_price: str) -> dict | None:
     prompt = f"""คุณคือนักวิเคราะห์ตลาดทองคำและ Forex มืออาชีพ เขียนบทวิเคราะห์ภาษาไทยให้นักลงทุนในชุมชน BTC Better Together
+
+ราคาทองคำ XAU/USD ปัจจุบัน: {gold_price}
+(ใช้ราคานี้เป็นฐานในการวิเคราะห์แนวรับ/แนวต้านจริง)
 
 ข่าวต้นฉบับ:
 หัวข้อ: {item['title']}
@@ -167,11 +201,11 @@ def analyze_with_gpt(item: dict) -> dict | None:
 
 ตอบเป็น JSON เท่านั้น:
 {{
-  "emoji": "emoji 1 ตัว (แนะนำ 🥇 สำหรับทอง, 🏦 Fed, ⚠️ ภูมิรัฐศาสตร์, 📈 เศรษฐกิจ)",
+  "emoji": "emoji 1 ตัว (🥇 ทอง, 🏦 Fed, ⚠️ ภูมิรัฐศาสตร์, 📈 เศรษฐกิจ, 🇺🇸 ทรัมป์)",
   "title_th": "หัวข้อภาษาไทย กระชับ ไม่เกิน 65 ตัวอักษร",
   "summary_th": "สรุป 2 ประโยค ว่าเกิดอะไรขึ้น",
-  "gold_impact": "วิเคราะห์ผลต่อทองคำ 2 ประโยค บอกทิศทางราคาทองที่คาดว่าจะเกิดขึ้นและเหตุผล",
-  "action": ["จับตา XAU/USD ที่แนวรับ/ต้าน XXX", "ระวัง/โอกาส ...", "หากข่าวออกมาแบบ X ทองจะ Y"],
+  "gold_impact": "วิเคราะห์ผลต่อทองคำ 2 ประโยค อ้างอิงราคาปัจจุบัน {gold_price} และบอกทิศทางที่คาดว่าจะเกิดขึ้น",
+  "action": ["แนวรับ/ต้านที่ใกล้เคียงราคาปัจจุบัน", "โอกาส/ความเสี่ยงที่ต้องระวัง", "สัญญาณที่ควรจับตา"],
   "gold_direction": "GOLD_UP หรือ GOLD_DOWN หรือ NEUTRAL",
   "usd_direction": "USD_UP หรือ USD_DOWN หรือ NEUTRAL"
 }}
@@ -277,10 +311,24 @@ def main():
     while True:
         print(f"\n[{datetime.now().strftime('%H:%M:%S')}] กำลังตรวจข่าวใหม่...")
 
-        all_items = fetch_forexfactory() + fetch_newsapi()
-        new_count = 0
+        # ดึงราคาทองคำปัจจุบันก่อนเลย
+        gold_price = fetch_gold_price()
+        print(f"  🥇 ราคาทอง XAU/USD: {gold_price}")
 
-        for item in all_items:
+        all_items = fetch_forexfactory() + fetch_newsapi()
+
+        # dedup ข่าวที่หัวข้อคล้ายกันมาก (ป้องกันเบิ้ล)
+        seen_titles: set[str] = set()
+        deduped_items = []
+        for it in all_items:
+            # ตัดคำสั้นๆ เหลือแค่ 6 คำแรก ใช้ fuzzy match แบบง่าย
+            short = " ".join(it["title"].lower().split()[:6])
+            if short not in seen_titles:
+                seen_titles.add(short)
+                deduped_items.append(it)
+
+        new_count = 0
+        for item in deduped_items:
             if not item["title"].strip():
                 continue
 
@@ -296,8 +344,8 @@ def main():
                 continue
             print(f"  📥 [{reason}] {item['title'][:55]}")
 
-            # ─── วิเคราะห์ด้วย GPT ─────────────────────────────────────────
-            analysis = analyze_with_gpt(item)
+            # ─── วิเคราะห์ด้วย GPT (ส่งราคาทองจริงเข้าไปด้วย) ────────────
+            analysis = analyze_with_gpt(item, gold_price)
             if not analysis:
                 continue
 
