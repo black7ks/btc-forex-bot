@@ -1,33 +1,35 @@
 """
-Forex News Discord Bot
+Forex News Discord Bot — BTC Better Together
 ดึงข่าว Forex จาก ForexFactory + NewsAPI
-แปลเป็นภาษาไทยด้วย deep-translator (ฟรี 100%)
-ส่งเข้า Discord อัตโนมัติ
+วิเคราะห์และเรียบเรียงเป็นภาษาไทยด้วย OpenAI GPT
+กรองเฉพาะข่าว USD ผลกระทบสูง ส่งเข้า Discord อัตโนมัติ
 """
 
 import os
-import re
 import time
 import json
 import hashlib
 import requests
 import feedparser
 from datetime import datetime, timezone
-from deep_translator import GoogleTranslator
+from openai import OpenAI
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────────
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 NEWSAPI_KEY         = os.environ.get("NEWSAPI_KEY", "")
+OPENAI_API_KEY      = os.environ.get("OPENAI_API_KEY", "")
 CHECK_INTERVAL_SEC  = int(os.environ.get("CHECK_INTERVAL_SEC", "600"))
+
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ─── SOURCES ──────────────────────────────────────────────────────────────────
 FOREXFACTORY_URL = "https://www.forexfactory.com/ff_calendar_thisweek.xml"
 NEWSAPI_URL      = "https://newsapi.org/v2/everything"
 NEWSAPI_PARAMS   = {
-    "q": "forex OR currency OR \"interest rate\" OR \"central bank\" OR USD OR EUR OR GBP",
+    "q": "USD OR \"federal reserve\" OR FOMC OR \"interest rate\" OR \"nonfarm payroll\" OR \"US inflation\" OR \"US GDP\"",
     "language": "en",
     "sortBy": "publishedAt",
-    "pageSize": 5,
+    "pageSize": 8,
     "apiKey": NEWSAPI_KEY,
 }
 
@@ -41,15 +43,14 @@ def load_sent_ids() -> set:
     return set()
 
 def save_sent_ids(ids: set):
-    trimmed = list(ids)[-500:]
     with open(SENT_IDS_FILE, "w") as f:
-        json.dump(trimmed, f)
+        json.dump(list(ids)[-500:], f)
 
 def make_id(text: str) -> str:
     return hashlib.md5(text.encode()).hexdigest()
 
 
-# ─── FETCH: ForexFactory RSS ──────────────────────────────────────────────────
+# ─── FETCH: ForexFactory ──────────────────────────────────────────────────────
 def fetch_forexfactory() -> list[dict]:
     try:
         feed = feedparser.parse(FOREXFACTORY_URL)
@@ -70,14 +71,12 @@ def fetch_forexfactory() -> list[dict]:
 # ─── FETCH: NewsAPI ────────────────────────────────────────────────────────────
 def fetch_newsapi() -> list[dict]:
     if not NEWSAPI_KEY:
-        print("[NewsAPI] ไม่มี API key ข้าม...")
         return []
     try:
         resp = requests.get(NEWSAPI_URL, params=NEWSAPI_PARAMS, timeout=10)
         resp.raise_for_status()
-        articles = resp.json().get("articles", [])
         results = []
-        for a in articles:
+        for a in resp.json().get("articles", []):
             results.append({
                 "source": f"NewsAPI · {a.get('source', {}).get('name', 'Unknown')}",
                 "title": a.get("title", ""),
@@ -90,124 +89,132 @@ def fetch_newsapi() -> list[dict]:
         return []
 
 
-# ─── TRANSLATE via deep-translator (ฟรี ไม่ต้องมี key) ────────────────────────
-translator = GoogleTranslator(source="en", target="th")
-
-def translate(text: str) -> str:
-    """แปลข้อความอังกฤษ → ไทย ด้วย Google Translate ฟรี"""
-    if not text or not text.strip():
-        return ""
-    try:
-        # Google Translate รับได้สูงสุด 5000 ตัวอักษรต่อครั้ง
-        text = text[:4500]
-        return translator.translate(text)
-    except Exception as e:
-        print(f"[Translate] Error: {e}")
-        return text  # fallback คืนค่าภาษาอังกฤษถ้าแปลไม่ได้
-
-
-# ─── DETECT: สกุลเงินและระดับผลกระทบ ─────────────────────────────────────────
-CURRENCY_PAIRS = ["USD", "EUR", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF",
-                  "CNY", "THB", "SGD", "HKD", "MXN", "INR"]
-
+# ─── FILTER: USD + High Impact ────────────────────────────────────────────────
+USD_KEYWORDS = [
+    "usd", "dollar", "fed", "federal reserve", "fomc", "powell",
+    "us economy", "u.s.", "united states", "nonfarm", "us cpi",
+    "us gdp", "us inflation", "us jobs", "treasury",
+    "eur/usd", "gbp/usd", "usd/jpy", "usd/cad", "usd/chf"
+]
 HIGH_IMPACT_KEYWORDS = [
     "fed", "federal reserve", "interest rate", "rate hike", "rate cut",
-    "inflation", "cpi", "gdp", "nonfarm", "fomc", "ecb", "boe",
+    "inflation", "cpi", "gdp", "nonfarm", "fomc", "powell",
     "central bank", "monetary policy", "recession", "unemployment"
 ]
 
-def detect_currencies(text: str) -> str:
-    """หาสกุลเงินที่พูดถึงในข่าว"""
-    found = [c for c in CURRENCY_PAIRS if c in text.upper()]
-    return " · ".join(found[:4]) if found else ""
+def is_high_impact_usd(title: str, summary: str) -> bool:
+    text = (title + " " + summary).lower()
+    usd_hit    = any(kw in text for kw in USD_KEYWORDS)
+    impact_hits = sum(1 for kw in HIGH_IMPACT_KEYWORDS if kw in text)
+    return usd_hit and impact_hits >= 2
 
-def detect_impact(title: str, summary: str) -> tuple[str, int]:
+
+# ─── ANALYZE via OpenAI ───────────────────────────────────────────────────────
+def analyze_with_gpt(item: dict) -> dict | None:
     """
-    ประเมินระดับผลกระทบจาก keyword
-    คืนค่า (label, discord_color)
+    ใช้ GPT แปล สรุป และวิเคราะห์ข่าว Forex เป็นภาษาไทย
+    คืนค่า dict พร้อมทุก field สำหรับ Discord embed
     """
-    combined = (title + " " + summary).lower()
-    hits = sum(1 for kw in HIGH_IMPACT_KEYWORDS if kw in combined)
-    if hits >= 3:
-        return "🔴 สูง", 0xE74C3C
-    elif hits >= 1:
-        return "🟠 กลาง", 0xF39C12
-    else:
-        return "🟢 ต่ำ", 0x2ECC71
+    prompt = f"""คุณคือนักวิเคราะห์ตลาด Forex มืออาชีพที่เขียนบทวิเคราะห์ภาษาไทยให้นักลงทุนในชุมชน BTC Better Together
 
-def pick_emoji(title: str) -> str:
-    """เลือก emoji ให้เหมาะกับเนื้อหาข่าว"""
-    t = title.lower()
-    if any(w in t for w in ["rate", "interest", "fed", "bank"]):
-        return "🏦"
-    elif any(w in t for w in ["inflation", "cpi", "price"]):
-        return "📈"
-    elif any(w in t for w in ["gdp", "growth", "economy"]):
-        return "💹"
-    elif any(w in t for w in ["job", "unemployment", "nonfarm"]):
-        return "👷"
-    elif any(w in t for w in ["gold", "oil", "commodity"]):
-        return "🛢️"
-    elif any(w in t for w in ["war", "conflict", "sanction"]):
-        return "⚠️"
-    else:
-        return "📰"
+ข่าวต้นฉบับ:
+หัวข้อ: {item['title']}
+รายละเอียด: {item['summary'][:1000]}
 
+กรุณาวิเคราะห์และตอบเป็น JSON เท่านั้น ตามรูปแบบนี้:
+{{
+  "emoji": "emoji 1 ตัวที่เหมาะกับข่าวนี้",
+  "title_th": "หัวข้อภาษาไทย กระชับ น่าสนใจ ไม่เกิน 70 ตัวอักษร",
+  "summary_th": "สรุปเนื้อหา 2-3 ประโยค อ่านเข้าใจง่าย ตรงประเด็น",
+  "analysis": "วิเคราะห์ผลกระทบต่อค่าเงิน USD และตลาด Forex 2-3 ประโยค บอกทิศทางที่คาดว่าจะเกิดขึ้น",
+  "action": "แนวทางที่นักเทรดควรระวังหรือจับตามอง เขียนเป็นข้อสั้นๆ 2-3 ข้อ",
+  "currencies": "สกุลเงินที่เกี่ยวข้อง เช่น USD · EUR · JPY",
+  "direction": "USD_UP หรือ USD_DOWN หรือ NEUTRAL (ทิศทาง USD ที่คาดการณ์)"
+}}
 
-# ─── PROCESS: แปลและวิเคราะห์ข่าว ────────────────────────────────────────────
-def process_item(item: dict) -> dict | None:
-    """แปลข่าวเป็นไทย + วิเคราะห์ผลกระทบ"""
-    title_th   = translate(item["title"])
-    summary_th = translate(item["summary"][:800]) if item["summary"] else ""
+ตอบเป็น JSON เท่านั้น ห้ามมีข้อความอื่น"""
 
-    if not title_th:
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",   # ประหยัด และดีพอสำหรับงานนี้
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=700,
+            temperature=0.3,
+        )
+        text = response.choices[0].message.content.strip()
+        text = text.replace("```json", "").replace("```", "").strip()
+        return json.loads(text)
+    except Exception as e:
+        print(f"[OpenAI] Error: {e}")
         return None
-
-    impact_label, color = detect_impact(item["title"], item["summary"])
-    currencies = detect_currencies(item["title"] + " " + item["summary"])
-    emoji = pick_emoji(item["title"])
-
-    return {
-        "title_th":   title_th,
-        "summary_th": summary_th,
-        "impact":     impact_label,
-        "color":      color,
-        "currencies": currencies,
-        "emoji":      emoji,
-    }
 
 
 # ─── DISCORD: ส่งข่าว ─────────────────────────────────────────────────────────
-def send_to_discord(item: dict, processed: dict):
-    now_th = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
+DIRECTION_COLOR = {
+    "USD_UP":   0x2ECC71,   # เขียว — USD แข็ง
+    "USD_DOWN": 0xE74C3C,   # แดง   — USD อ่อน
+    "NEUTRAL":  0xF39C12,   # ส้ม   — ทรงตัว
+}
 
-    fields = []
-    if processed["currencies"]:
-        fields.append({
-            "name": "💱 สกุลเงินที่เกี่ยวข้อง",
-            "value": processed["currencies"],
+def send_to_discord(item: dict, analysis: dict):
+    direction = analysis.get("direction", "NEUTRAL")
+    color     = DIRECTION_COLOR.get(direction, 0x3498DB)
+    now_th    = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
+
+    # แปลง action string เป็น bullet list
+    action_text = analysis.get("action", "")
+    if action_text and not action_text.startswith("•"):
+        lines = [l.strip() for l in action_text.split("\n") if l.strip()]
+        action_text = "\n".join(f"• {l.lstrip('•-').strip()}" for l in lines)
+
+    # Direction badge
+    direction_badge = {
+        "USD_UP":   "💚 USD แข็งค่า",
+        "USD_DOWN": "🔴 USD อ่อนค่า",
+        "NEUTRAL":  "🟡 ทรงตัว",
+    }.get(direction, "⚪ ไม่ชัดเจน")
+
+    fields = [
+        {
+            "name": "📋 สรุปข่าว",
+            "value": analysis.get("summary_th", "-"),
+            "inline": False,
+        },
+        {
+            "name": "🔍 วิเคราะห์ผลกระทบ",
+            "value": analysis.get("analysis", "-"),
+            "inline": False,
+        },
+        {
+            "name": "💡 จับตามอง",
+            "value": action_text or "-",
+            "inline": False,
+        },
+        {
+            "name": "💱 สกุลเงิน",
+            "value": analysis.get("currencies", "USD"),
             "inline": True,
-        })
-    fields.append({
-        "name": "📊 ระดับผลกระทบ",
-        "value": f"**{processed['impact']}**",
-        "inline": True,
-    })
-    fields.append({
-        "name": "🔗 อ่านเพิ่มเติม",
-        "value": f"[คลิกที่นี่]({item['link']})" if item.get("link") else "ไม่มีลิงก์",
-        "inline": True,
-    })
+        },
+        {
+            "name": "📊 ทิศทาง USD",
+            "value": f"**{direction_badge}**",
+            "inline": True,
+        },
+        {
+            "name": "🔗 ต้นฉบับ",
+            "value": f"[อ่านเพิ่มเติม]({item['link']})" if item.get("link") else "-",
+            "inline": True,
+        },
+    ]
 
     payload = {
         "username": "BTC Forex News 📡",
         "embeds": [{
-            "title": f"{processed['emoji']} {processed['title_th']}",
-            "description": processed["summary_th"] or "(ไม่มีรายละเอียดเพิ่มเติม)",
-            "color": processed["color"],
+            "title": f"{analysis.get('emoji','📰')} {analysis.get('title_th', item['title'])}",
+            "color": color,
             "fields": fields,
             "footer": {
-                "text": f"แหล่งที่มา: {item['source']}  •  {now_th}"
+                "text": f"แหล่งที่มา: {item['source']}  •  {now_th}  •  วิเคราะห์โดย GPT-4o mini"
             },
         }]
     }
@@ -215,7 +222,7 @@ def send_to_discord(item: dict, processed: dict):
     try:
         resp = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
         if resp.status_code in (200, 204):
-            print(f"  ✅ ส่งสำเร็จ: {processed['title_th'][:50]}")
+            print(f"  ✅ ส่งสำเร็จ: {analysis.get('title_th','')[:50]}")
         else:
             print(f"  ❌ Discord Error {resp.status_code}: {resp.text[:100]}")
     except Exception as e:
@@ -225,14 +232,17 @@ def send_to_discord(item: dict, processed: dict):
 # ─── MAIN LOOP ────────────────────────────────────────────────────────────────
 def main():
     print("=" * 55)
-    print("🚀 BTC Forex News Bot เริ่มทำงาน (ฟรี 100%)")
+    print("🚀 BTC Forex News Bot เริ่มทำงาน")
     print(f"   ตรวจข่าวทุก {CHECK_INTERVAL_SEC // 60} นาที")
-    print(f"   แปลภาษา: Google Translate (deep-translator)")
-    print(f"   ⚠️  ส่งเฉพาะข่าวผลกระทบ: 🔴 สูง เท่านั้น")
+    print(f"   วิเคราะห์โดย: OpenAI GPT-4o mini")
+    print(f"   กรอง: USD + ผลกระทบสูงเท่านั้น")
     print("=" * 55)
 
     if not DISCORD_WEBHOOK_URL:
         print("❌ ERROR: ยังไม่ได้ตั้งค่า DISCORD_WEBHOOK_URL")
+        return
+    if not OPENAI_API_KEY:
+        print("❌ ERROR: ยังไม่ได้ตั้งค่า OPENAI_API_KEY")
         return
 
     sent_ids = load_sent_ids()
@@ -251,45 +261,28 @@ def main():
             if item_id in sent_ids:
                 continue
 
-            print(f"  📥 {item['title'][:65]}")
-
-            # แปลและวิเคราะห์
-            processed = process_item(item)
-            if not processed:
-                continue
-
-            # ✅ กรองเฉพาะข่าวผลกระทบสูงเท่านั้น
-            if "สูง" not in processed["impact"]:
-                print(f"  ⏭ ข้าม ({processed['impact']}): {item['title'][:50]}")
-                sent_ids.add(item_id)  # mark ว่าเห็นแล้ว ไม่ต้องเช็คซ้ำ
-                continue
-
-            # ✅ กรองเฉพาะข่าวที่เกี่ยวกับ USD เท่านั้น
-            USD_KEYWORDS = [
-                "usd", "dollar", "fed", "federal reserve", "fomc",
-                "us economy", "u.s.", "united states", "nonfarm",
-                "cpi us", "us gdp", "us inflation", "us jobs",
-                "powell", "treasury", "eur/usd", "gbp/usd",
-                "usd/jpy", "usd/cad", "usd/chf", "audusd", "nzdusd"
-            ]
-            title_lower   = item["title"].lower()
-            summary_lower = item["summary"].lower()
-            is_usd_related = any(kw in title_lower or kw in summary_lower for kw in USD_KEYWORDS)
-
-            if not is_usd_related:
-                print(f"  ⏭ ข้าม (ไม่เกี่ยว USD): {item['title'][:50]}")
+            # ─── Filter: USD + High Impact ──────────────────────────────────
+            if not is_high_impact_usd(item["title"], item["summary"]):
+                print(f"  ⏭ ข้าม: {item['title'][:55]}")
                 sent_ids.add(item_id)
                 continue
 
-            # ส่งเข้า Discord
-            send_to_discord(item, processed)
+            print(f"  📥 วิเคราะห์: {item['title'][:60]}")
+
+            # ─── วิเคราะห์ด้วย GPT ─────────────────────────────────────────
+            analysis = analyze_with_gpt(item)
+            if not analysis:
+                continue
+
+            # ─── ส่ง Discord ────────────────────────────────────────────────
+            send_to_discord(item, analysis)
 
             sent_ids.add(item_id)
             new_count += 1
-            time.sleep(2)  # ป้องกัน rate limit
+            time.sleep(2)
 
         save_sent_ids(sent_ids)
-        print(f"  ✔ ข่าวใหม่ {new_count} ข่าว | รอ {CHECK_INTERVAL_SEC // 60} นาที...")
+        print(f"  ✔ ส่ง {new_count} ข่าว | รอ {CHECK_INTERVAL_SEC // 60} นาที...")
         time.sleep(CHECK_INTERVAL_SEC)
 
 
