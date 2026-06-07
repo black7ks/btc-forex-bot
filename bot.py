@@ -89,43 +89,63 @@ def fetch_newsapi() -> list[dict]:
         return []
 
 
-# ─── FILTER: USD + High Impact ────────────────────────────────────────────────
-USD_KEYWORDS = [
-    # USD / ตลาดการเงิน
-    "usd", "dollar", "fed", "federal reserve", "fomc", "powell",
-    "us economy", "u.s.", "united states", "nonfarm", "us cpi",
-    "us gdp", "us inflation", "us jobs", "treasury",
-    "eur/usd", "gbp/usd", "usd/jpy", "usd/cad", "usd/chf",
-    "wall street", "us market", "american", "us dollar", "greenback",
-    "jobs report", "payroll", "debt", "yield", "bond",
-    # ทรัมป์ + การเมืองสหรัฐฯ ที่กระทบตลาด
-    "trump", "tariff", "trade war", "sanction", "executive order",
-    "white house", "congress", "senate", "pentagon", "iran", "china trade",
-    "mexico", "canada tariff", "nato", "geopolit"
-]
-HIGH_IMPACT_KEYWORDS = [
-    "fed", "federal reserve", "interest rate", "rate hike", "rate cut",
-    "inflation", "cpi", "gdp", "nonfarm", "fomc", "powell",
-    "central bank", "monetary policy", "recession", "unemployment",
-    "jobs", "dollar", "rally", "boost", "trigger", "market outlook",
-    # ทรัมป์ / ภูมิรัฐศาสตร์
-    "trump", "tariff", "trade war", "sanction", "deal", "ceasefire",
-    "iran", "oil", "war", "conflict", "crisis", "breaking"
-]
+# ─── FILTER ───────────────────────────────────────────────────────────────────
 
+# ข่าวทรัมป์ → ส่งทุกข่าวที่เกี่ยวทรัมป์
 TRUMP_KEYWORDS = [
-    "trump", "tariff", "trade war", "white house", "executive order",
-    "sanction", "iran", "china trade", "nato", "pentagon", "ceasefire",
-    "deal", "breaking"
+    "trump", "donald trump", "white house", "tariff", "trade war",
+    "executive order", "sanction", "iran deal", "nato", "pentagon",
+    "ceasefire", "truth social", "maga"
 ]
 
-def is_high_impact_usd(title: str, summary: str) -> bool:
+# ข่าวทองคำโดยตรง
+GOLD_KEYWORDS = [
+    "gold", "xau", "xauusd", "xau/usd", "bullion",
+    "gold price", "spot gold", "precious metal"
+]
+
+# ข่าว USD ระดับกลาง-สูง ที่กระทบทอง
+USD_MEDIUM_HIGH = [
+    # Fed / ดอกเบี้ย (สูง)
+    "fed", "federal reserve", "fomc", "powell", "interest rate",
+    "rate hike", "rate cut", "rate decision", "monetary policy",
+    # เศรษฐกิจสหรัฐฯ (สูง)
+    "nonfarm", "payroll", "jobs report", "unemployment", "cpi",
+    "inflation", "gdp", "retail sales", "pce", "ism",
+    # ตลาดการเงิน (กลาง)
+    "treasury yield", "bond yield", "dxy", "dollar index",
+    "real yield", "debt ceiling", "us budget", "us deficit",
+    "recession", "stagflation",
+    # ภูมิรัฐศาสตร์ที่กระทบ safe haven (กลาง)
+    "war", "conflict", "crisis", "geopolit", "risk off",
+    "safe haven", "russia", "israel", "china tension",
+    "north korea", "middle east"
+]
+
+def should_send(title: str, summary: str) -> tuple[bool, str]:
+    """
+    คืนค่า (ส่งไหม, เหตุผล)
+    ส่งถ้าเข้าเงื่อนไขใดเงื่อนไขหนึ่ง:
+      1. ข่าวทรัมป์
+      2. ข่าวทองคำโดยตรง
+      3. ข่าว USD ระดับกลาง-สูง ที่กระทบทอง
+    """
     text = (title + " " + summary).lower()
-    usd_hit      = any(kw in text for kw in USD_KEYWORDS)
-    impact_hits  = sum(1 for kw in HIGH_IMPACT_KEYWORDS if kw in text)
-    trump_hit    = any(kw in text for kw in TRUMP_KEYWORDS)
-    # ผ่านถ้า: (เกี่ยว USD + มี impact keyword) หรือ (ข่าวทรัมป์/ภูมิรัฐศาสตร์)
-    return (usd_hit and impact_hits >= 1) or trump_hit
+
+    # เงื่อนไข 1: ข่าวทรัมป์
+    if any(kw in text for kw in TRUMP_KEYWORDS):
+        return True, "ทรัมป์"
+
+    # เงื่อนไข 2: ข่าวทองคำโดยตรง
+    if any(kw in text for kw in GOLD_KEYWORDS):
+        return True, "ทองคำ"
+
+    # เงื่อนไข 3: USD ระดับกลาง-สูง (ต้องมีอย่างน้อย 2 keyword)
+    usd_hits = sum(1 for kw in USD_MEDIUM_HIGH if kw in text)
+    if usd_hits >= 2:
+        return True, f"USD ({usd_hits} hits)"
+
+    return False, ""
 
 
 # ─── ANALYZE via OpenAI ───────────────────────────────────────────────────────
@@ -134,30 +154,33 @@ def analyze_with_gpt(item: dict) -> dict | None:
     ใช้ GPT แปล สรุป และวิเคราะห์ข่าว Forex เป็นภาษาไทย
     คืนค่า dict พร้อมทุก field สำหรับ Discord embed
     """
-    prompt = f"""คุณคือนักวิเคราะห์ตลาด Forex มืออาชีพที่เขียนบทวิเคราะห์ภาษาไทยให้นักลงทุนในชุมชน BTC Better Together
+    prompt = f"""คุณคือนักวิเคราะห์ตลาดทองคำและ Forex มืออาชีพ เขียนบทวิเคราะห์ภาษาไทยให้นักลงทุนในชุมชน BTC Better Together
 
 ข่าวต้นฉบับ:
 หัวข้อ: {item['title']}
 รายละเอียด: {item['summary'][:1000]}
 
-หมายเหตุ: ข่าวการเมืองสหรัฐฯ เช่น นโยบายทรัมป์ ภาษีนำเข้า สงครามการค้า มาตรการคว่ำบาตร ล้วนกระทบค่าเงิน USD และตลาด Forex โดยตรง ให้วิเคราะห์ผลกระทบเหล่านี้ด้วย
+โฟกัสหลัก: วิเคราะห์ว่าข่าวนี้กระทบ **ราคาทองคำ (XAU/USD)** อย่างไร
+- ข่าว Fed / ดอกเบี้ย / เงินเฟ้อ → กระทบ real yield → กระทบทอง
+- ข่าวทรัมป์ / ภูมิรัฐศาสตร์ / สงคราม → กระทบ safe haven → กระทบทอง
+- ข่าวเศรษฐกิจสหรัฐฯ → กระทบ USD → กระทบทอง
 
-กรุณาวิเคราะห์และตอบเป็น JSON เท่านั้น ตามรูปแบบนี้:
+ตอบเป็น JSON เท่านั้น:
 {{
-  "emoji": "emoji 1 ตัวที่เหมาะกับข่าวนี้",
-  "title_th": "หัวข้อภาษาไทย กระชับ น่าสนใจ ไม่เกิน 70 ตัวอักษร",
-  "summary_th": "สรุปเนื้อหา 2-3 ประโยค อ่านเข้าใจง่าย ตรงประเด็น",
-  "analysis": "วิเคราะห์ผลกระทบต่อค่าเงิน USD และตลาด Forex 2-3 ประโยค บอกทิศทางที่คาดว่าจะเกิดขึ้น",
-  "action": "แนวทางที่นักเทรดควรระวังหรือจับตามอง เขียนเป็นข้อสั้นๆ 2-3 ข้อ",
-  "currencies": "สกุลเงินที่เกี่ยวข้อง เช่น USD · EUR · JPY",
-  "direction": "USD_UP หรือ USD_DOWN หรือ NEUTRAL (ทิศทาง USD ที่คาดการณ์)"
+  "emoji": "emoji 1 ตัว (แนะนำ 🥇 สำหรับทอง, 🏦 Fed, ⚠️ ภูมิรัฐศาสตร์, 📈 เศรษฐกิจ)",
+  "title_th": "หัวข้อภาษาไทย กระชับ ไม่เกิน 65 ตัวอักษร",
+  "summary_th": "สรุป 2 ประโยค ว่าเกิดอะไรขึ้น",
+  "gold_impact": "วิเคราะห์ผลต่อทองคำ 2 ประโยค บอกทิศทางราคาทองที่คาดว่าจะเกิดขึ้นและเหตุผล",
+  "action": ["จับตา XAU/USD ที่แนวรับ/ต้าน XXX", "ระวัง/โอกาส ...", "หากข่าวออกมาแบบ X ทองจะ Y"],
+  "gold_direction": "GOLD_UP หรือ GOLD_DOWN หรือ NEUTRAL",
+  "usd_direction": "USD_UP หรือ USD_DOWN หรือ NEUTRAL"
 }}
 
-ตอบเป็น JSON เท่านั้น ห้ามมีข้อความอื่น"""
+ตอบ JSON เท่านั้น ห้ามมีข้อความอื่น"""
 
     try:
         response = client.chat.completions.create(
-            model="gpt-4o-mini",   # ประหยัด และดีพอสำหรับงานนี้
+            model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
             max_tokens=700,
             temperature=0.3,
@@ -171,21 +194,21 @@ def analyze_with_gpt(item: dict) -> dict | None:
 
 
 # ─── DISCORD: ส่งข่าว ─────────────────────────────────────────────────────────
-DIRECTION_COLOR = {
-    "USD_UP":   0x2ECC71,   # เขียว — USD แข็ง
-    "USD_DOWN": 0xE74C3C,   # แดง   — USD อ่อน
-    "NEUTRAL":  0xF39C12,   # ส้ม   — ทรงตัว
+GOLD_COLOR = {
+    "GOLD_UP":   0xF1C40F,   # ทอง  — ราคาทองขึ้น
+    "GOLD_DOWN": 0xE74C3C,   # แดง  — ราคาทองลง
+    "NEUTRAL":   0x95A5A6,   # เทา  — ทรงตัว
 }
 
 def send_to_discord(item: dict, analysis: dict):
-    direction = analysis.get("direction", "NEUTRAL")
-    color     = DIRECTION_COLOR.get(direction, 0x3498DB)
+    gold_dir  = analysis.get("gold_direction", "NEUTRAL")
+    usd_dir   = analysis.get("usd_direction", "NEUTRAL")
+    color     = GOLD_COLOR.get(gold_dir, 0x95A5A6)
     now_th    = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
 
     # แปลง action เป็น bullet list (รองรับทั้ง string และ list จาก GPT)
-    action_raw  = analysis.get("action", "")
+    action_raw = analysis.get("action", "")
     if isinstance(action_raw, list):
-        # GPT ส่งมาเป็น list → แปลงเป็น bullet
         action_text = "\n".join(f"• {a.lstrip('•-').strip()}" for a in action_raw if a)
     elif isinstance(action_raw, str) and action_raw:
         lines = [l.strip() for l in action_raw.split("\n") if l.strip()]
@@ -193,55 +216,33 @@ def send_to_discord(item: dict, analysis: dict):
     else:
         action_text = "-"
 
-    # Direction badge
-    direction_badge = {
-        "USD_UP":   "💚 USD แข็งค่า",
-        "USD_DOWN": "🔴 USD อ่อนค่า",
-        "NEUTRAL":  "🟡 ทรงตัว",
-    }.get(direction, "⚪ ไม่ชัดเจน")
+    # Badge ทิศทาง
+    gold_badge = {"GOLD_UP": "🟡 ทองขึ้น", "GOLD_DOWN": "🔴 ทองลง", "NEUTRAL": "⚪ ทรงตัว"}.get(gold_dir, "⚪")
+    usd_badge  = {"USD_UP": "💚 USD แข็ง", "USD_DOWN": "🔴 USD อ่อน", "NEUTRAL": "⚪ ทรงตัว"}.get(usd_dir, "⚪")
 
-    fields = [
-        {
-            "name": "📋 สรุปข่าว",
-            "value": analysis.get("summary_th", "-"),
-            "inline": False,
-        },
-        {
-            "name": "🔍 วิเคราะห์ผลกระทบ",
-            "value": analysis.get("analysis", "-"),
-            "inline": False,
-        },
-        {
-            "name": "💡 จับตามอง",
-            "value": action_text or "-",
-            "inline": False,
-        },
-        {
-            "name": "💱 สกุลเงิน",
-            "value": analysis.get("currencies", "USD"),
-            "inline": True,
-        },
-        {
-            "name": "📊 ทิศทาง USD",
-            "value": f"**{direction_badge}**",
-            "inline": True,
-        },
-        {
-            "name": "🔗 ต้นฉบับ",
-            "value": f"[อ่านเพิ่มเติม]({item['link']})" if item.get("link") else "-",
-            "inline": True,
-        },
-    ]
+    # ใช้ description แทน fields เพื่อให้มีช่องว่างระหว่างหัวข้อ อ่านง่ายขึ้น
+    description = (
+        f"**📋 สรุปข่าว**\n"
+        f"{analysis.get('summary_th', '-')}\n"
+        f"\n"
+        f"**🥇 ผลต่อทองคำ**\n"
+        f"{analysis.get('gold_impact', '-')}\n"
+        f"\n"
+        f"**💡 จับตามอง**\n"
+        f"{action_text}\n"
+        f"\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🥇 ทองคำ: **{gold_badge}**　　💵 USD: **{usd_badge}**\n"
+        f"🔗 [อ่านต้นฉบับ]({item['link']})" if item.get("link") else ""
+    )
 
     payload = {
         "username": "BTC Forex News 📡",
         "embeds": [{
-            "title": f"{analysis.get('emoji','📰')} {analysis.get('title_th', item['title'])}",
+            "title": f"{analysis.get('emoji','🥇')} {analysis.get('title_th', item['title'])}",
+            "description": description,
             "color": color,
-            "fields": fields,
-            "footer": {
-                "text": f"แหล่งที่มา: {item['source']}  •  {now_th}  •  วิเคราะห์โดย GPT-4o mini"
-            },
+
         }]
     }
 
@@ -287,13 +288,13 @@ def main():
             if item_id in sent_ids:
                 continue
 
-            # ─── Filter: USD + High Impact ──────────────────────────────────
-            if not is_high_impact_usd(item["title"], item["summary"]):
+            # ─── Filter ─────────────────────────────────────────────────────
+            pass_filter, reason = should_send(item["title"], item["summary"])
+            if not pass_filter:
                 print(f"  ⏭ ข้าม: {item['title'][:55]}")
                 sent_ids.add(item_id)
                 continue
-
-            print(f"  📥 วิเคราะห์: {item['title'][:60]}")
+            print(f"  📥 [{reason}] {item['title'][:55]}")
 
             # ─── วิเคราะห์ด้วย GPT ─────────────────────────────────────────
             analysis = analyze_with_gpt(item)
