@@ -1,4 +1,3 @@
 requests==2.31.0
 feedparser==6.0.11
-deep-translator==1.11.4
-beautifulsoup4==4.12.3
+openai==1.52.0
