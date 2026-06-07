@@ -228,6 +228,7 @@ def main():
     print("🚀 BTC Forex News Bot เริ่มทำงาน (ฟรี 100%)")
     print(f"   ตรวจข่าวทุก {CHECK_INTERVAL_SEC // 60} นาที")
     print(f"   แปลภาษา: Google Translate (deep-translator)")
+    print(f"   ⚠️  ส่งเฉพาะข่าวผลกระทบ: 🔴 สูง เท่านั้น")
     print("=" * 55)
 
     if not DISCORD_WEBHOOK_URL:
@@ -255,6 +256,29 @@ def main():
             # แปลและวิเคราะห์
             processed = process_item(item)
             if not processed:
+                continue
+
+            # ✅ กรองเฉพาะข่าวผลกระทบสูงเท่านั้น
+            if "สูง" not in processed["impact"]:
+                print(f"  ⏭ ข้าม ({processed['impact']}): {item['title'][:50]}")
+                sent_ids.add(item_id)  # mark ว่าเห็นแล้ว ไม่ต้องเช็คซ้ำ
+                continue
+
+            # ✅ กรองเฉพาะข่าวที่เกี่ยวกับ USD เท่านั้น
+            USD_KEYWORDS = [
+                "usd", "dollar", "fed", "federal reserve", "fomc",
+                "us economy", "u.s.", "united states", "nonfarm",
+                "cpi us", "us gdp", "us inflation", "us jobs",
+                "powell", "treasury", "eur/usd", "gbp/usd",
+                "usd/jpy", "usd/cad", "usd/chf", "audusd", "nzdusd"
+            ]
+            title_lower   = item["title"].lower()
+            summary_lower = item["summary"].lower()
+            is_usd_related = any(kw in title_lower or kw in summary_lower for kw in USD_KEYWORDS)
+
+            if not is_usd_related:
+                print(f"  ⏭ ข้าม (ไม่เกี่ยว USD): {item['title'][:50]}")
+                sent_ids.add(item_id)
                 continue
 
             # ส่งเข้า Discord
