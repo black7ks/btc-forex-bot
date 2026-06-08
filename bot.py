@@ -52,37 +52,8 @@ def make_id(text: str) -> str:
     return hashlib.md5(normalized.encode()).hexdigest()
 
 
-# ─── FETCH: ราคาทองคำ real-time ──────────────────────────────────────────────
-def fetch_gold_price() -> str:
-    """ดึงราคาทองคำปัจจุบันจาก public API"""
-    try:
-        # ใช้ metals.live — ฟรี ไม่ต้อง key
-        resp = requests.get(
-            "https://api.metals.live/v1/spot/gold",
-            timeout=8
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            price = data.get("price") or data.get("gold")
-            if price:
-                return f"${float(price):,.2f}"
-    except Exception:
-        pass
 
-    # fallback: frankfurter (ใช้ XAU ต่อ USD)
-    try:
-        resp = requests.get(
-            "https://api.frankfurter.app/latest?from=XAU&to=USD",
-            timeout=8
-        )
-        if resp.status_code == 200:
-            rate = resp.json().get("rates", {}).get("USD")
-            if rate:
-                return f"${float(rate):,.2f}"
-    except Exception:
-        pass
 
-    return "N/A (ไม่สามารถดึงราคาได้)"
 
 
 # ─── FETCH: ForexFactory ──────────────────────────────────────────────────────
@@ -158,56 +129,71 @@ USD_MEDIUM_HIGH = [
 ]
 
 def should_send(title: str, summary: str) -> tuple[bool, str]:
-    """
-    คืนค่า (ส่งไหม, เหตุผล)
-    ส่งถ้าเข้าเงื่อนไขใดเงื่อนไขหนึ่ง:
-      1. ข่าวทรัมป์
-      2. ข่าวทองคำโดยตรง
-      3. ข่าว USD ระดับกลาง-สูง ที่กระทบทอง
-    """
     text = (title + " " + summary).lower()
 
-    # เงื่อนไข 1: ข่าวทรัมป์
-    if any(kw in text for kw in TRUMP_KEYWORDS):
-        return True, "ทรัมป์"
+    # ข่าวทรัมป์ที่กระทบตลาดจริง (ไม่เอาทุกข่าว)
+    trump_market_kw = [
+        "trump tariff", "trump sanction", "trump trade",
+        "trump iran", "trump israel", "trump fed", "trump rate",
+        "trump china", "trump russia", "trump nato", "trump deal",
+        "trump ceasefire", "trump executive"
+    ]
+    if any(kw in text for kw in trump_market_kw):
+        return True, "🇺🇸 ทรัมป์"
 
-    # เงื่อนไข 2: ข่าวทองคำโดยตรง
+    # ข่าวภูมิรัฐศาสตร์รุนแรง — กระทบ safe haven / ทอง
+    geopolitical_kw = [
+        "war break", "attack", "strike", "invasion", "missile",
+        "nuclear", "ceasefire", "breaking", "airstrike",
+        "middle east crisis", "israel iran", "russia ukraine"
+    ]
+    if any(kw in text for kw in geopolitical_kw):
+        return True, "⚠️ ภูมิรัฐศาสตร์"
+
+    # ข่าว Fed / ดอกเบี้ย — กระทบ USD และทองโดยตรง
+    fed_kw = [
+        "fed rate", "fomc", "interest rate decision", "rate hike",
+        "rate cut", "federal reserve decision", "powell speech",
+        "monetary policy", "quantitative"
+    ]
+    if any(kw in text for kw in fed_kw):
+        return True, "🏦 Fed"
+
+    # ข่าวทองคำโดยตรง + มีนัยสำคัญ
     if any(kw in text for kw in GOLD_KEYWORDS):
-        return True, "ทองคำ"
+        strong_kw = ["surge", "plunge", "record", "hit", "rally",
+                     "crash", "all-time", "high", "low", "break"]
+        if any(kw in text for kw in strong_kw):
+            return True, "🥇 ทองคำ"
 
-    # เงื่อนไข 3: USD ระดับกลาง-สูง (ต้องมีอย่างน้อย 2 keyword)
-    usd_hits = sum(1 for kw in USD_MEDIUM_HIGH if kw in text)
-    if usd_hits >= 2:
-        return True, f"USD ({usd_hits} hits)"
+    # ข่าวเศรษฐกิจสหรัฐฯ ระดับสูง
+    macro_kw = [
+        "nonfarm payroll", "cpi report", "gdp growth", "pce inflation",
+        "unemployment rate", "retail sales", "ism manufacturing",
+        "consumer confidence", "jobs report"
+    ]
+    if any(kw in text for kw in macro_kw):
+        return True, "📊 เศรษฐกิจ"
 
     return False, ""
 
 
 # ─── ANALYZE via OpenAI ───────────────────────────────────────────────────────
-def analyze_with_gpt(item: dict, gold_price: str) -> dict | None:
-    prompt = f"""คุณคือนักวิเคราะห์ตลาดทองคำและ Forex มืออาชีพ เขียนบทวิเคราะห์ภาษาไทยให้นักลงทุนในชุมชน BTC Better Together
-
-ราคาทองคำ XAU/USD ปัจจุบัน: {gold_price}
-(ใช้ราคานี้เป็นฐานในการวิเคราะห์แนวรับ/แนวต้านจริง)
+def analyze_with_gpt(item: dict) -> dict | None:
+    prompt = f"""คุณคือบรรณาธิการข่าวการเงินภาษาไทย สำหรับชุมชนนักเทรดทองคำ BTC Better Together
 
 ข่าวต้นฉบับ:
 หัวข้อ: {item['title']}
 รายละเอียด: {item['summary'][:1000]}
 
-โฟกัสหลัก: วิเคราะห์ว่าข่าวนี้กระทบ **ราคาทองคำ (XAU/USD)** อย่างไร
-- ข่าว Fed / ดอกเบี้ย / เงินเฟ้อ → กระทบ real yield → กระทบทอง
-- ข่าวทรัมป์ / ภูมิรัฐศาสตร์ / สงคราม → กระทบ safe haven → กระทบทอง
-- ข่าวเศรษฐกิจสหรัฐฯ → กระทบ USD → กระทบทอง
+งานของคุณ: เขียนข่าวด่วนภาษาไทยแบบกระชับ อ่านเข้าใจใน 5 วินาที
+สไตล์: เหมือนข่าวด่วน Breaking News บน X (Twitter) — สั้น ตรง มีผลกระทบชัดเจน
 
 ตอบเป็น JSON เท่านั้น:
 {{
-  "emoji": "emoji 1 ตัว (🥇 ทอง, 🏦 Fed, ⚠️ ภูมิรัฐศาสตร์, 📈 เศรษฐกิจ, 🇺🇸 ทรัมป์)",
-  "title_th": "หัวข้อภาษาไทย กระชับ ไม่เกิน 65 ตัวอักษร",
-  "summary_th": "สรุป 2 ประโยค ว่าเกิดอะไรขึ้น",
-  "gold_impact": "วิเคราะห์ผลต่อทองคำ 2 ประโยค อ้างอิงราคาปัจจุบัน {gold_price} และบอกทิศทางที่คาดว่าจะเกิดขึ้น",
-  "action": ["แนวรับ/ต้านที่ใกล้เคียงราคาปัจจุบัน", "โอกาส/ความเสี่ยงที่ต้องระวัง", "สัญญาณที่ควรจับตา"],
-  "gold_direction": "GOLD_UP หรือ GOLD_DOWN หรือ NEUTRAL",
-  "usd_direction": "USD_UP หรือ USD_DOWN หรือ NEUTRAL"
+  "emoji": "emoji 1 ตัวที่เหมาะสม (⚠️ ข่าวรุนแรง, 🇺🇸 ทรัมป์/สหรัฐฯ, 🏦 Fed/ดอกเบี้ย, 🥇 ทอง, 📊 เศรษฐกิจ)",
+  "title_th": "หัวข้อข่าวด่วนภาษาไทย กระชับ ตรง ไม่เกิน 60 ตัวอักษร",
+  "body_th": "เนื้อหาข่าว 3-4 ประโยค: (1) เกิดอะไรขึ้น (2) ทำไมถึงสำคัญ (3) กระทบ USD และทองคำอย่างไร เขียนเป็นย่อหน้าเดียว อ่านลื่นไหล ไม่มีหัวข้อย่อย"
 }}
 
 ตอบ JSON เท่านั้น ห้ามมีข้อความอื่น"""
@@ -216,7 +202,7 @@ def analyze_with_gpt(item: dict, gold_price: str) -> dict | None:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=700,
+            max_tokens=500,
             temperature=0.3,
         )
         text = response.choices[0].message.content.strip()
@@ -228,55 +214,20 @@ def analyze_with_gpt(item: dict, gold_price: str) -> dict | None:
 
 
 # ─── DISCORD: ส่งข่าว ─────────────────────────────────────────────────────────
-GOLD_COLOR = {
-    "GOLD_UP":   0xF1C40F,   # ทอง  — ราคาทองขึ้น
-    "GOLD_DOWN": 0xE74C3C,   # แดง  — ราคาทองลง
-    "NEUTRAL":   0x95A5A6,   # เทา  — ทรงตัว
-}
-
 def send_to_discord(item: dict, analysis: dict):
-    gold_dir  = analysis.get("gold_direction", "NEUTRAL")
-    usd_dir   = analysis.get("usd_direction", "NEUTRAL")
-    color     = GOLD_COLOR.get(gold_dir, 0x95A5A6)
-    now_th    = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
+    link_line = f"\n🔗 [อ่านต้นฉบับ]({item['link']})" if item.get("link") else ""
 
-    # แปลง action เป็น bullet list (รองรับทั้ง string และ list จาก GPT)
-    action_raw = analysis.get("action", "")
-    if isinstance(action_raw, list):
-        action_text = "\n".join(f"• {a.lstrip('•-').strip()}" for a in action_raw if a)
-    elif isinstance(action_raw, str) and action_raw:
-        lines = [l.strip() for l in action_raw.split("\n") if l.strip()]
-        action_text = "\n".join(f"• {l.lstrip('•-').strip()}" for l in lines)
-    else:
-        action_text = "-"
-
-    # Badge ทิศทาง
-    gold_badge = {"GOLD_UP": "🟡 ทองขึ้น", "GOLD_DOWN": "🔴 ทองลง", "NEUTRAL": "⚪ ทรงตัว"}.get(gold_dir, "⚪")
-    usd_badge  = {"USD_UP": "💚 USD แข็ง", "USD_DOWN": "🔴 USD อ่อน", "NEUTRAL": "⚪ ทรงตัว"}.get(usd_dir, "⚪")
-
-    # ใช้ description แทน fields เพื่อให้มีช่องว่างระหว่างหัวข้อ อ่านง่ายขึ้น
     description = (
-        f"**📋 สรุปข่าว**\n"
-        f"{analysis.get('summary_th', '-')}\n"
-        f"\n"
-        f"**🥇 ผลต่อทองคำ**\n"
-        f"{analysis.get('gold_impact', '-')}\n"
-        f"\n"
-        f"**💡 จับตามอง**\n"
-        f"{action_text}\n"
-        f"\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🥇 ทองคำ: **{gold_badge}**　　💵 USD: **{usd_badge}**\n"
-        f"🔗 [อ่านต้นฉบับ]({item['link']})" if item.get("link") else ""
+        f"{analysis.get('body_th', '-')}"
+        f"{link_line}"
     )
 
     payload = {
         "username": "BTC Forex News 📡",
         "embeds": [{
-            "title": f"{analysis.get('emoji','🥇')} {analysis.get('title_th', item['title'])}",
+            "title": f"{analysis.get('emoji','📰')} {analysis.get('title_th', item['title'])}",
             "description": description,
-            "color": color,
-
+            "color": 0x2B2D31,  # สีเทาเข้ม ไม่มีแถบสี
         }]
     }
 
@@ -311,17 +262,12 @@ def main():
     while True:
         print(f"\n[{datetime.now().strftime('%H:%M:%S')}] กำลังตรวจข่าวใหม่...")
 
-        # ดึงราคาทองคำปัจจุบันก่อนเลย
-        gold_price = fetch_gold_price()
-        print(f"  🥇 ราคาทอง XAU/USD: {gold_price}")
-
+        # ดึงและ dedup ข่าว
         all_items = fetch_forexfactory() + fetch_newsapi()
 
-        # dedup ข่าวที่หัวข้อคล้ายกันมาก (ป้องกันเบิ้ล)
         seen_titles: set[str] = set()
         deduped_items = []
         for it in all_items:
-            # ตัดคำสั้นๆ เหลือแค่ 6 คำแรก ใช้ fuzzy match แบบง่าย
             short = " ".join(it["title"].lower().split()[:6])
             if short not in seen_titles:
                 seen_titles.add(short)
@@ -336,7 +282,6 @@ def main():
             if item_id in sent_ids:
                 continue
 
-            # ─── Filter ─────────────────────────────────────────────────────
             pass_filter, reason = should_send(item["title"], item["summary"])
             if not pass_filter:
                 print(f"  ⏭ ข้าม: {item['title'][:55]}")
@@ -344,12 +289,10 @@ def main():
                 continue
             print(f"  📥 [{reason}] {item['title'][:55]}")
 
-            # ─── วิเคราะห์ด้วย GPT (ส่งราคาทองจริงเข้าไปด้วย) ────────────
-            analysis = analyze_with_gpt(item, gold_price)
+            analysis = analyze_with_gpt(item)
             if not analysis:
                 continue
 
-            # ─── ส่ง Discord ────────────────────────────────────────────────
             send_to_discord(item, analysis)
 
             sent_ids.add(item_id)
