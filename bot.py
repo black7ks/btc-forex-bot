@@ -34,22 +34,38 @@ NEWSAPI_PARAMS   = {
 }
 
 # ─── STATE ────────────────────────────────────────────────────────────────────
+# เก็บเป็น {id: timestamp} แทน set ธรรมดา
+# เพื่อให้รู้ว่าข่าวนี้ส่งไปเมื่อไหร่ และ clear อัตโนมัติหลัง 48 ชม.
 SENT_IDS_FILE = "sent_ids.json"
+DEDUP_HOURS   = 48  # ข่าวเดิมจะไม่ส่งซ้ำภายใน 48 ชั่วโมง
 
-def load_sent_ids() -> set:
+def load_sent_ids() -> dict:
     if os.path.exists(SENT_IDS_FILE):
         with open(SENT_IDS_FILE, "r") as f:
-            return set(json.load(f))
-    return set()
+            return json.load(f)
+    return {}
 
-def save_sent_ids(ids: set):
+def save_sent_ids(ids: dict):
+    # ลบข่าวที่เก่ากว่า 48 ชม. ออก ไม่ให้ไฟล์ใหญ่เกิน
+    cutoff = time.time() - DEDUP_HOURS * 3600
+    trimmed = {k: v for k, v in ids.items() if v > cutoff}
     with open(SENT_IDS_FILE, "w") as f:
-        json.dump(list(ids)[-500:], f)
+        json.dump(trimmed, f)
+
+def is_recently_sent(ids: dict, item_id: str) -> bool:
+    if item_id not in ids:
+        return False
+    age_hours = (time.time() - ids[item_id]) / 3600
+    return age_hours < DEDUP_HOURS
 
 def make_id(text: str) -> str:
-    # normalize ให้ตัวพิมพ์เล็ก ตัดช่องว่างซ้ำ ป้องกันข่าวเบิ้ล
     normalized = " ".join(text.lower().split())
     return hashlib.md5(normalized.encode()).hexdigest()
+
+def make_short_id(text: str) -> str:
+    """ใช้ 5 คำแรก เพื่อจับข่าวเดียวกันที่หัวข้อต่างนิดหน่อย"""
+    short = " ".join(text.lower().split()[:5])
+    return hashlib.md5(short.encode()).hexdigest()
 
 
 
@@ -256,20 +272,20 @@ def main():
         print("❌ ERROR: ยังไม่ได้ตั้งค่า OPENAI_API_KEY")
         return
 
-    sent_ids = load_sent_ids()
+    sent_ids = load_sent_ids()  # dict {id: timestamp}
 
     while True:
         print(f"\n[{datetime.now().strftime('%H:%M:%S')}] กำลังตรวจข่าวใหม่...")
 
-        # ดึงและ dedup ข่าว
         all_items = fetch_forexfactory() + fetch_newsapi()
 
-        seen_titles: set[str] = set()
+        # dedup ข่าวในรอบเดียวกัน (กัน ForexFactory + NewsAPI ส่งข่าวเดียวกัน)
+        seen_short: set[str] = set()
         deduped_items = []
         for it in all_items:
-            short = " ".join(it["title"].lower().split()[:6])
-            if short not in seen_titles:
-                seen_titles.add(short)
+            sid = make_short_id(it["title"])
+            if sid not in seen_short:
+                seen_short.add(sid)
                 deduped_items.append(it)
 
         new_count = 0
@@ -277,14 +293,17 @@ def main():
             if not item["title"].strip():
                 continue
 
-            item_id = make_id(item["title"])
-            if item_id in sent_ids:
+            # เช็ค 2 ชั้น: full title + short title (5 คำแรก)
+            item_id       = make_id(item["title"])
+            item_short_id = make_short_id(item["title"])
+
+            if is_recently_sent(sent_ids, item_id) or is_recently_sent(sent_ids, item_short_id):
                 continue
 
             pass_filter, reason = should_send(item["title"], item["summary"])
             if not pass_filter:
-                print(f"  ⏭ ข้าม: {item['title'][:55]}")
-                sent_ids.add(item_id)
+                # mark ว่าเห็นแล้วแต่ไม่ผ่าน filter — ไม่ต้องเก็บ timestamp
+                sent_ids[item_id] = time.time()
                 continue
             print(f"  📥 [{reason}] {item['title'][:55]}")
 
@@ -294,7 +313,10 @@ def main():
 
             send_to_discord(item, analysis)
 
-            sent_ids.add(item_id)
+            # บันทึกทั้ง 2 id พร้อม timestamp
+            now_ts = time.time()
+            sent_ids[item_id]       = now_ts
+            sent_ids[item_short_id] = now_ts
             new_count += 1
             time.sleep(2)
 
