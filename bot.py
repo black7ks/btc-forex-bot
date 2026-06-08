@@ -131,49 +131,52 @@ USD_MEDIUM_HIGH = [
 def should_send(title: str, summary: str) -> tuple[bool, str]:
     text = (title + " " + summary).lower()
 
-    # ข่าวทรัมป์ที่กระทบตลาดจริง (ไม่เอาทุกข่าว)
+    # 1. ทรัมป์ที่กระทบตลาดโดยตรง
     trump_market_kw = [
         "trump tariff", "trump sanction", "trump trade",
         "trump iran", "trump israel", "trump fed", "trump rate",
         "trump china", "trump russia", "trump nato", "trump deal",
-        "trump ceasefire", "trump executive"
+        "trump ceasefire", "trump executive order"
     ]
     if any(kw in text for kw in trump_market_kw):
         return True, "🇺🇸 ทรัมป์"
 
-    # ข่าวภูมิรัฐศาสตร์รุนแรง — กระทบ safe haven / ทอง
-    geopolitical_kw = [
-        "war break", "attack", "strike", "invasion", "missile",
-        "nuclear", "ceasefire", "breaking", "airstrike",
-        "middle east crisis", "israel iran", "russia ukraine"
+    # 2. ภูมิรัฐศาสตร์รุนแรง — กระทบ safe haven / ทอง
+    geo_kw = [
+        "airstrike", "missile attack", "nuclear", "invasion",
+        "war declared", "ceasefire", "israel iran", "russia ukraine",
+        "middle east war", "breaking: attack", "military strike"
     ]
-    if any(kw in text for kw in geopolitical_kw):
+    if any(kw in text for kw in geo_kw):
         return True, "⚠️ ภูมิรัฐศาสตร์"
 
-    # ข่าว Fed / ดอกเบี้ย — กระทบ USD และทองโดยตรง
+    # 3. Fed / ดอกเบี้ย — ข่าวสำคัญระดับสูง
     fed_kw = [
-        "fed rate", "fomc", "interest rate decision", "rate hike",
-        "rate cut", "federal reserve decision", "powell speech",
-        "monetary policy", "quantitative"
+        "rate hike", "rate cut", "fomc decision", "fed raises",
+        "fed cuts", "powell press conference", "emergency rate",
+        "rate decision", "federal reserve raises", "federal reserve cuts"
     ]
     if any(kw in text for kw in fed_kw):
         return True, "🏦 Fed"
 
-    # ข่าวทองคำโดยตรง + มีนัยสำคัญ
-    if any(kw in text for kw in GOLD_KEYWORDS):
-        strong_kw = ["surge", "plunge", "record", "hit", "rally",
-                     "crash", "all-time", "high", "low", "break"]
-        if any(kw in text for kw in strong_kw):
-            return True, "🥇 ทองคำ"
-
-    # ข่าวเศรษฐกิจสหรัฐฯ ระดับสูง
+    # 4. ข้อมูลเศรษฐกิจสหรัฐฯ ระดับสูงมาก (top-tier only)
     macro_kw = [
-        "nonfarm payroll", "cpi report", "gdp growth", "pce inflation",
-        "unemployment rate", "retail sales", "ism manufacturing",
-        "consumer confidence", "jobs report"
+        "nonfarm payroll", "non-farm payroll",
+        "cpi beats", "cpi misses", "cpi higher", "cpi lower",
+        "inflation surges", "inflation falls",
+        "gdp contracts", "gdp shrinks", "recession confirmed",
+        "unemployment jumps", "unemployment falls"
     ]
     if any(kw in text for kw in macro_kw):
         return True, "📊 เศรษฐกิจ"
+
+    # 5. ทองคำ — เฉพาะข่าวใหญ่มาก
+    gold_big_kw = [
+        "gold hits record", "gold all-time high", "gold surges",
+        "gold plunges", "gold crashes", "gold breaks", "xau record"
+    ]
+    if any(kw in text for kw in gold_big_kw):
+        return True, "🥇 ทองคำ"
 
     return False, ""
 
@@ -215,20 +218,16 @@ def analyze_with_gpt(item: dict) -> dict | None:
 
 # ─── DISCORD: ส่งข่าว ─────────────────────────────────────────────────────────
 def send_to_discord(item: dict, analysis: dict):
-    link_line = f"\n🔗 [อ่านต้นฉบับ]({item['link']})" if item.get("link") else ""
-
-    description = (
+    # ส่งเป็น plain text เหมือนคนพิมพ์ ไม่มีกล่อง/กรอบ ไม่มีลิงก์
+    message = (
+        f"{analysis.get('emoji','📰')} **{analysis.get('title_th', item['title'])}**\n"
+        f"\n"
         f"{analysis.get('body_th', '-')}"
-        f"{link_line}"
     )
 
     payload = {
         "username": "BTC Forex News 📡",
-        "embeds": [{
-            "title": f"{analysis.get('emoji','📰')} {analysis.get('title_th', item['title'])}",
-            "description": description,
-            "color": 0x2B2D31,  # สีเทาเข้ม ไม่มีแถบสี
-        }]
+        "content": message,   # ใช้ content แทน embeds → ไม่มีกรอบ
     }
 
     try:
