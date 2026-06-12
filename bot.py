@@ -16,22 +16,22 @@ from openai import OpenAI
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────────
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
-NEWSAPI_KEY         = os.environ.get("NEWSAPI_KEY", "")
 OPENAI_API_KEY      = os.environ.get("OPENAI_API_KEY", "")
 CHECK_INTERVAL_SEC  = int(os.environ.get("CHECK_INTERVAL_SEC", "600"))
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ─── SOURCES ──────────────────────────────────────────────────────────────────
-FOREXFACTORY_URL = "https://www.forexfactory.com/ff_calendar_thisweek.xml"
-NEWSAPI_URL      = "https://newsapi.org/v2/everything"
-NEWSAPI_PARAMS   = {
-    "q": "USD OR \"federal reserve\" OR FOMC OR \"interest rate\" OR \"nonfarm payroll\" OR \"US inflation\" OR \"US GDP\"",
-    "language": "en",
-    "sortBy": "publishedAt",
-    "pageSize": 8,
-    "apiKey": NEWSAPI_KEY,
-}
+# ─── SOURCES — เฉพาะแหล่งข่าว Forex/Gold โดยตรง ──────────────────────────────
+RSS_FEEDS = [
+    # ForexFactory — ข่าวตลาด Forex HIGH IMPACT
+    ("ForexFactory",  "https://www.forexfactory.com/rss"),
+    # FXStreet — ข่าว Forex เฉพาะทาง
+    ("FXStreet",      "https://www.fxstreet.com/rss"),
+    # Investing.com — ข่าว Gold & USD
+    ("Investing.com", "https://www.investing.com/rss/news.rss"),
+    # Reuters Economy
+    ("Reuters",       "https://feeds.reuters.com/reuters/businessNews"),
+]
 
 # ─── STATE ────────────────────────────────────────────────────────────────────
 # เก็บเป็น {id: timestamp} แทน set ธรรมดา
@@ -72,43 +72,27 @@ def make_short_id(text: str) -> str:
 
 
 
-# ─── FETCH: ForexFactory ──────────────────────────────────────────────────────
-def fetch_forexfactory() -> list[dict]:
-    try:
-        feed = feedparser.parse(FOREXFACTORY_URL)
-        results = []
-        for entry in feed.entries[:8]:
-            results.append({
-                "source": "ForexFactory",
-                "title": entry.get("title", ""),
-                "summary": entry.get("summary", entry.get("description", "")),
-                "link": entry.get("link", ""),
-            })
-        return results
-    except Exception as e:
-        print(f"[ForexFactory] Error: {e}")
-        return []
-
-
-# ─── FETCH: NewsAPI ────────────────────────────────────────────────────────────
-def fetch_newsapi() -> list[dict]:
-    if not NEWSAPI_KEY:
-        return []
-    try:
-        resp = requests.get(NEWSAPI_URL, params=NEWSAPI_PARAMS, timeout=10)
-        resp.raise_for_status()
-        results = []
-        for a in resp.json().get("articles", []):
-            results.append({
-                "source": f"NewsAPI · {a.get('source', {}).get('name', 'Unknown')}",
-                "title": a.get("title", ""),
-                "summary": a.get("description", "") or a.get("content", ""),
-                "link": a.get("url", ""),
-            })
-        return results
-    except Exception as e:
-        print(f"[NewsAPI] Error: {e}")
-        return []
+# ─── FETCH: RSS feeds ─────────────────────────────────────────────────────────
+def fetch_all_rss() -> list[dict]:
+    results = []
+    for source_name, url in RSS_FEEDS:
+        try:
+            feed = feedparser.parse(url)
+            for entry in feed.entries[:10]:
+                title   = entry.get("title", "").strip()
+                summary = entry.get("summary", entry.get("description", "")).strip()
+                link    = entry.get("link", "")
+                if title:
+                    results.append({
+                        "source":  source_name,
+                        "title":   title,
+                        "summary": summary[:1000],
+                        "link":    link,
+                    })
+            print(f"  📡 {source_name}: {len(feed.entries)} entries")
+        except Exception as e:
+            print(f"  ❌ {source_name} RSS Error: {e}")
+    return results
 
 
 # ─── FILTER ───────────────────────────────────────────────────────────────────
@@ -277,7 +261,7 @@ def main():
     while True:
         print(f"\n[{datetime.now().strftime('%H:%M:%S')}] กำลังตรวจข่าวใหม่...")
 
-        all_items = fetch_forexfactory() + fetch_newsapi()
+        all_items = fetch_all_rss()
 
         # dedup ข่าวในรอบเดียวกัน (กัน ForexFactory + NewsAPI ส่งข่าวเดียวกัน)
         seen_short: set[str] = set()
